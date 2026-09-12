@@ -1,0 +1,8 @@
+edge_profile/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.env
+api_gateway.db
