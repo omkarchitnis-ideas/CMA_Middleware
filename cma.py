@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 # --- Load Environment Variables ---
 load_dotenv()
+try:
+    from teams_notifier import send_teams_alert
+except ImportError:
+    def send_teams_alert(*args, **kwargs): pass
 
 BASE_URL = "https://g3-cma.ideas.com/cma/adhocSql"
 DB_FILE = "api_gateway.db"
@@ -79,11 +83,25 @@ def trip_circuit_breaker(reason="CMA auto-login timed out or login is blocked"):
     duration = min(CIRCUIT_BREAKER_BASE_SECONDS * CONSECUTIVE_AUTH_FAILURES, 600)
     CIRCUIT_BREAKER_UNTIL = time.time() + duration
     logger.warning(f"⚠️ CIRCUIT BREAKER TRIPPED ({reason}). Suppressing CMA auto-login for {duration}s.")
+    send_teams_alert(
+        service_name="CMA Middleware",
+        title="Circuit Breaker Tripped",
+        message=f"CMA auto-login timed out or login is blocked ({reason}). Queries will fast-fail for {duration}s.",
+        severity="CRITICAL",
+        details={"Duration": f"{duration}s", "Failures": CONSECUTIVE_AUTH_FAILURES, "Port": PORT}
+    )
 
 def reset_circuit_breaker():
     global CIRCUIT_BREAKER_UNTIL, CONSECUTIVE_AUTH_FAILURES
     if CONSECUTIVE_AUTH_FAILURES > 0 or CIRCUIT_BREAKER_UNTIL > 0:
         logger.info("✅ Circuit breaker RESET. CMA login is fully restored.")
+        send_teams_alert(
+            service_name="CMA Middleware",
+            title="Circuit Breaker Reset - Service Restored",
+            message="CMA login is fully restored. Queries are executing normally.",
+            severity="SUCCESS",
+            details={"Port": PORT, "Status": "Healthy"}
+        )
     CONSECUTIVE_AUTH_FAILURES = 0
     CIRCUIT_BREAKER_UNTIL = 0
 

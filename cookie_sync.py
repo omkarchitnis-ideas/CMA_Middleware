@@ -6,6 +6,10 @@ import urllib.request
 import requests
 import logging
 import websockets
+try:
+    from teams_notifier import send_teams_alert
+except ImportError:
+    def send_teams_alert(*args, **kwargs): pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -147,11 +151,25 @@ def run_sync_loop():
                 
             if needs_refresh:
                 logger.info("Triggering autonomous CDP auto-login cycle...")
+                send_teams_alert(
+                    service_name="CMA Middleware",
+                    title="Session Expired - Re-authenticating",
+                    message="CMA Undertow session expired. Initiating autonomous in-container SSO re-login.",
+                    severity="WARNING",
+                    details={"Engine": "Edge CDP", "Port": 8555}
+                )
                 sess_id = asyncio.run(perform_cdp_auto_login())
                 if sess_id and is_cookie_valid(sess_id):
                     logger.info("Auto-login SUCCESS! New valid JSESSIONID obtained.")
                     if push_cookie_to_cma(sess_id):
                         last_pushed_cookie = sess_id
+                        send_teams_alert(
+                            service_name="CMA Middleware",
+                            title="Session Restored Successfully",
+                            message="Autonomous SSO re-login completed. New JSESSIONID injected into CMA Gateway.",
+                            severity="SUCCESS",
+                            details={"Session Prefix": f"{sess_id[:15]}...", "Status": "Active"}
+                        )
                 else:
                     logger.warning("Auto-login cycle did not yield a valid session yet. Retrying next interval...")
         except Exception as e:
