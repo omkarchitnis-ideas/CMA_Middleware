@@ -1,14 +1,11 @@
 import os
 import time
-import shutil
-import sqlite3
+import json
+import asyncio
+import urllib.request
 import requests
-import subprocess
 import logging
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
+import websockets
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,59 +13,88 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cookie_sync")
 
-COOKIES_DB = "/app/edge_profile/Default/Cookies"
 CMA_URL = "https://g3-cma.ideas.com/cma/adhocSql/viewAdhoc"
 UPDATE_ENDPOINT = "http://localhost:8555/api/internal/update_cookie"
+CDP_LIST_URL = "http://localhost:9222/json/list"
 
-def get_chromium_key():
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA1(),
-        length=16,
-        salt=b'saltysalt',
-        iterations=1,
-        backend=default_backend()
-    )
-    return kdf.derive(b'peanuts')
-
-AES_KEY = get_chromium_key()
-IV = b' ' * 16
-
-def extract_cma_cookie():
-    if not os.path.exists(COOKIES_DB):
-        return None
-        
-    tmp_db = "/tmp/cookies_reader.sqlite"
+async def get_cma_tab():
     try:
-        shutil.copyfile(COOKIES_DB, tmp_db)
-        conn = sqlite3.connect(tmp_db)
-        cur = conn.cursor()
-        cur.execute("SELECT encrypted_value FROM cookies WHERE host_key LIKE '%cma%' AND name='JSESSIONID'")
-        row = cur.fetchone()
-        conn.close()
-        
-        if not row or not row[0]:
-            return None
-            
-        enc = row[0]
-        if not (enc.startswith(b'v10') or enc.startswith(b'v11')):
-            return None
-            
-        ciphertext = enc[3:]
-        cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(IV), backend=default_backend())
-        dec = cipher.decryptor().update(ciphertext)
-        
-        # In Linux Chromium, plaintext starts at byte offset 32
-        candidate = dec[32:].split(b'\x00')[0]
-        pad = candidate[-1]
-        if isinstance(pad, int) and pad < 16:
-            candidate = candidate[:-pad]
-            
-        return candidate.decode('latin1', errors='ignore')
+        req = urllib.request.Request(CDP_LIST_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            tabs = json.loads(resp.read().decode())
+        for t in tabs:
+            if "cma" in t.get("url", "") or "ideas.com" in t.get("url", ""):
+                return t
+        for t in tabs:
+            if t.get("type") == "page":
+                return t
     except Exception as e:
-        logger.error(f"Failed to read/decrypt cookie: {e}")
+        logger.debug(f"CDP list error: {e}")
+    return None
+
+async def perform_cdp_auto_login():
+    """Checks the Edge tab, clicks 'Login with SSO' if needed, and returns the fresh JSESSIONID."""
+    tab = await get_cma_tab()
+    if not tab:
+        logger.warning("No Edge tab found via CDP on port 9222.")
         return None
+        
+    ws_url = tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return None
+
+    try:
+        async with websockets.connect(ws_url, timeout=5) as ws:
+            # 1. Check current URL
+            await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": "window.location.href"}}))
+            res = json.loads(await ws.recv())
+            curr_url = res.get("result", {}).get("result", {}).get("value", "")
+            logger.info(f"Edge current URL: {curr_url}")
+            
+            # If on login page, click SSO button
+            if "login" in curr_url.lower() or "auth" in curr_url.lower():
+                logger.info("Detected login page! Triggering SSO button click...")
+                await ws.send(json.dumps({
+                    "id": 2,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "if (document.getElementById('ssoButton')) { document.getElementById('ssoButton').click(); 'clicked'; } else { 'not_found'; }"}
+                }))
+                click_res = json.loads(await ws.recv())
+                logger.info(f"SSO click result: {click_res.get('result', {}).get('result', {}).get('value')}")
+                
+                # Wait for Cognito & CMA redirect
+                await asyncio.sleep(4)
+            elif "adhocsql" not in curr_url.lower():
+                # Navigate to adhocSql to establish/verify session
+                logger.info("Navigating Edge tab to viewAdhoc...")
+                await ws.send(json.dumps({
+                    "id": 3,
+                    "method": "Page.navigate",
+                    "params": {"url": CMA_URL}
+                }))
+                await ws.recv()
+                await asyncio.sleep(3)
+                
+            # 2. Extract cookies via Storage.getCookies
+            await ws.send(json.dumps({"id": 4, "method": "Network.enable"}))
+            await ws.recv()
+            await ws.send(json.dumps({"id": 5, "method": "Storage.getCookies"}))
+            cookie_res = json.loads(await ws.recv())
+            cookies = cookie_res.get("result", {}).get("cookies", [])
+            
+            for c in cookies:
+                if c.get("name") == "JSESSIONID" and "cma" in c.get("domain", ""):
+                    sess_id = c.get("value")
+                    logger.info(f"Extracted JSESSIONID via CDP: {sess_id[:15]}...")
+                    return sess_id
+    except Exception as e:
+        logger.error(f"Error during CDP auto-login: {e}")
+        
+    return None
 
 def is_cookie_valid(sess_id):
+    if not sess_id:
+        return False
     try:
         resp = requests.get(
             CMA_URL,
@@ -81,7 +107,7 @@ def is_cookie_valid(sess_id):
         )
         return resp.status_code == 200
     except Exception as e:
-        logger.warning(f"Error checking cookie validity: {e}")
+        logger.warning(f"Error validating cookie: {e}")
         return False
 
 def push_cookie_to_cma(sess_id):
@@ -97,35 +123,37 @@ def push_cookie_to_cma(sess_id):
         logger.error(f"Exception pushing cookie: {e}")
     return False
 
-def trigger_edge_navigation():
-    logger.info("Triggering Edge navigation to refresh session...")
-    try:
-        subprocess.Popen(
-            ["microsoft-edge-stable", "--no-sandbox", CMA_URL],
-            env=dict(os.environ, DISPLAY=":99")
-        )
-    except Exception as e:
-        logger.error(f"Failed to trigger Edge navigation: {e}")
-
 def run_sync_loop():
-    last_known_cookie = None
-    logger.info("Starting background Cookie Sync daemon...")
+    logger.info("Starting Autonomous Cookie Auto-Login & Sync Daemon...")
+    last_pushed_cookie = None
     
     while True:
         try:
-            sess_id = extract_cma_cookie()
-            if sess_id:
-                if sess_id != last_known_cookie:
-                    logger.info(f"Detected new JSESSIONID candidate ({sess_id[:15]}...). Checking validity...")
-                    if is_cookie_valid(sess_id):
-                        logger.info("Candidate JSESSIONID is valid! Updating CMA Middleware...")
-                        if push_cookie_to_cma(sess_id):
-                            last_known_cookie = sess_id
-                    else:
-                        logger.warning("Candidate JSESSIONID returned redirect / unauthenticated.")
+            needs_refresh = False
+            try:
+                status_res = requests.get("http://localhost:8555/api/internal/needs_cookie", timeout=2)
+                if status_res.status_code == 200:
+                    data = status_res.json()
+                    needs_refresh = data.get("needs_cookie", False)
+            except Exception:
+                pass
+                
+            if last_pushed_cookie:
+                if not is_cookie_valid(last_pushed_cookie):
+                    logger.warning("Currently cached JSESSIONID has EXPIRED! Initiating auto-login...")
+                    needs_refresh = True
+            else:
+                needs_refresh = True
+                
+            if needs_refresh:
+                logger.info("Triggering autonomous CDP auto-login cycle...")
+                sess_id = asyncio.run(perform_cdp_auto_login())
+                if sess_id and is_cookie_valid(sess_id):
+                    logger.info("Auto-login SUCCESS! New valid JSESSIONID obtained.")
+                    if push_cookie_to_cma(sess_id):
+                        last_pushed_cookie = sess_id
                 else:
-                    # Periodic validity check every 5 minutes
-                    pass
+                    logger.warning("Auto-login cycle did not yield a valid session yet. Retrying next interval...")
         except Exception as e:
             logger.error(f"Error in sync loop: {e}")
             

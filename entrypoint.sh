@@ -30,6 +30,7 @@ echo "Launching Microsoft Edge for SSO verification..."
 microsoft-edge-stable \
     --no-sandbox \
     --disable-dev-shm-usage \
+    --remote-debugging-port=9222 \
     --user-data-dir=/app/edge_profile \
     "https://g3-cma.ideas.com/cma/adhocSql/viewAdhoc" &
 
