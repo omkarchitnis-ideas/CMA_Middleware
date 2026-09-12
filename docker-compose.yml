@@ -11,3 +11,13 @@ services:
       - ./api_gateway.db:/app/api_gateway.db
     env_file:
       - .env
+    networks:
+      - cma_net
+
+networks:
+  cma_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.200.3.0/24
