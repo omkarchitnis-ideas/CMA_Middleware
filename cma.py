@@ -116,14 +116,18 @@ def load_chains_cache():
 # ==========================================
 LAST_BROWSER_LAUNCH = 0
 LAUNCH_COOLDOWN_SECONDS = 15  
+NEED_AUTH_RECOVERY = False
 
 def trigger_sso_login(force=False):
-    global LAST_BROWSER_LAUNCH
+    global LAST_BROWSER_LAUNCH, NEED_AUTH_RECOVERY
     # If circuit breaker is active, do NOT launch Chrome
     active, remaining = is_circuit_breaker_active()
     if active and not force:
         logger.warning(f"Skipping Chrome launch: Circuit breaker is active ({remaining}s remaining). CMA login is blocked/maintenance.")
         return False
+
+    # Signal to Chrome Extension polling endpoint that a fresh cookie is needed
+    NEED_AUTH_RECOVERY = True
 
     current_time = time.time()
     time_since_last = current_time - LAST_BROWSER_LAUNCH
@@ -138,21 +142,23 @@ def trigger_sso_login(force=False):
             logger.info(f"Session expired! Attempting to launch batch file at: {bat_path}")
             
             if not os.path.exists(bat_path):
-                logger.error(f"CRITICAL: Batch file NOT FOUND at {bat_path}")
-                return False
+                logger.warning(f"Batch file not found at {bat_path}. In Docker environment, relying on Chrome Extension auto-poll.")
+                LAST_BROWSER_LAUNCH = current_time
+                return True
 
-            # Execute the batch file
+            # Execute the batch file (native Windows)
             subprocess.Popen(['cmd.exe', '/c', 'launch_chrome.bat'], cwd=bat_dir)
             logger.info("Batch file execution command sent successfully.")
             LAST_BROWSER_LAUNCH = current_time
             return True
             
         except Exception as e:
-            logger.error(f"Failed to launch Chrome: {e}", exc_info=True)
-            return False
+            logger.info(f"Native Chrome launch bypassed ({e}). In Docker container: Chrome Extension background worker will handle auto-login.")
+            LAST_BROWSER_LAUNCH = current_time
+            return True
     else:
         logger.debug(f"Skipping Chrome launch due to {LAUNCH_COOLDOWN_SECONDS}s cooldown ({time_since_last:.1f}s elapsed).")
-        return False
+        return True
 # ==========================================
 # 1. DATABASE & AUDIT LOGGING
 # ==========================================
@@ -964,9 +970,20 @@ def client_run():
         return send_file(zip_buffer, mimetype="application/zip", as_attachment=True, download_name="TaskDetailReports_Batch.zip")
         
 ######
+@app.route('/api/internal/needs_cookie', methods=['GET'])
+def internal_needs_cookie():
+    """Polled by the Chrome Extension background worker to detect if CMA needs an auto-login."""
+    global NEED_AUTH_RECOVERY, ACTIVE_CMA_COOKIE
+    needs = NEED_AUTH_RECOVERY or not bool(ACTIVE_CMA_COOKIE)
+    return jsonify({
+        "needs_cookie": bool(needs),
+        "has_cookie": bool(ACTIVE_CMA_COOKIE)
+    })
+
 @app.route('/api/internal/update_cookie', methods=['POST'])
 def internal_update_cookie():
     """Receives new cookie directly from the Chrome Extension, updates .env, and refreshes."""
+    global ACTIVE_CMA_COOKIE, NEED_AUTH_RECOVERY
     logger.info(f"Received /api/internal/update_cookie request from IP: {request.remote_addr}")
 
     data = request.get_json(silent=True) or {}
@@ -980,9 +997,9 @@ def internal_update_cookie():
         clean_cookie = new_cookie.strip()
 
         # 1. Update in-memory cookie immediately under lock
-        global ACTIVE_CMA_COOKIE
         with COOKIE_LOCK:
             ACTIVE_CMA_COOKIE = clean_cookie
+            NEED_AUTH_RECOVERY = False
 
         # 2. Update physical .env file for persistence across restarts
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
