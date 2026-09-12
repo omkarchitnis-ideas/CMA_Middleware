@@ -1211,7 +1211,7 @@ def api_execute_batch():
             return send_file(zip_buffer, mimetype="application/zip", as_attachment=True, download_name="TaskDetailReports_Batch.zip")
 
 if __name__ == '__main__':
-    print(f"🚀 CMA Terminal Running on http://localhost:{PORT}")
+    print(f"[*] CMA Terminal Running on http://localhost:{PORT}")
     if not GLOBAL_CHAINS:
         logger.info("Startup chains empty. Triggering Chrome auto-login in 2s once port is listening...")
         threading.Thread(target=lambda: (time.sleep(2), trigger_sso_login(force=True)), daemon=True, name="startup_auto_login").start()
