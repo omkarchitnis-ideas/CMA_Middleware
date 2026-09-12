@@ -2,19 +2,21 @@
 """
 CMA Enterprise Model Context Protocol (MCP) Server
 =================================================
-Production-grade MCP server for the SAS IDeaS Client Management Application (CMA).
-Provides complete, future-proof access to G3 Global, Job, Ratchet, and 19,496+ Tenant databases.
+Comprehensive 34-Tool Suite for the SAS IDeaS Client Management Application (CMA).
 
 Key Capabilities:
-- Full Universal Query & Batch Execution across all G3 database chains
-- Fast in-memory indexing and search across 19,496+ cached client database chains
-- Deep property and stage mode inspection (Property & Property_AUD)
-- Cascading configuration parameter matrix resolution (pacman -> pacman.CLIENT -> pacman.CLIENT.PROP)
-- Spring Batch execution telemetry (JOB_INSTANCE, JOB_EXECUTION, JOB_EXECUTION_PARAMS)
-- Tenant database catalog access with schema validation
-- Session health monitoring, Edge CDP SSO automated re-login, and circuit breaker telemetry
-- Gateway audit log search & operational system stats
-- Dual Transport: HTTP Server-Sent Events (SSE) with /health probe & Stdio CLI transport
+1. Core SQL Execution: Arbitrary single and multi-chain batch execution.
+2. Schema & Metadata Discovery: Wildcard table search, schema reflection, column types.
+3. Cluster & Environment Resolution: Automatic PROD_1..6 mapping, client portfolio lookup.
+4. Global Property & Parameter Matrix: Cascading pacman context resolution, datafeed interfaces.
+5. Spring Batch Processing: Job execution, failed step triage, blocked jobs, daily throughput.
+6. Tenant Revenue & Pacing Metrics: Accom_Activity and PACE_Accom_Activity reconciliation.
+7. Salesforce Case Audit Trail: Full historical query log by SFDC Case # and exact SQL recovery.
+8. Curated Engineering Scripts: 2,000+ pre-built queries tagged by case and operational domain.
+9. Real-Time Team Diagnostics: Live team query execution feeds and Job ID search.
+10. Remote Cluster File Explorer: Browse G3 Prod 1..6 data directories and RSS log drops.
+11. Configuration & Automation: Property System Parameters, scheduled recurring SQL jobs.
+12. Session Resilience: Automated Edge CDP SSO re-login, circuit breaker, audit logging.
 """
 
 import os
@@ -28,6 +30,10 @@ import argparse
 from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
+import urllib.parse
+from datetime import datetime, timedelta
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -49,6 +55,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHAINS_CACHE_PATH = os.getenv("CHAINS_CACHE_PATH", os.path.join(SCRIPT_DIR, "chains_cache.json"))
 DB_FILE = os.getenv("DB_FILE", os.path.join(SCRIPT_DIR, "api_gateway.db"))
 
+CMA_WEB_BASE = "https://g3-cma.ideas.com/cma"
 CMA_GATEWAY_URL = os.getenv("CMA_GATEWAY_URL", "http://172.27.210.162:8555")
 CMA_API_KEY = os.getenv("CMA_API_KEY", "cma_6Z2AkhS4ux70JGlTa4mzGeWVVhaQRGWu")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
@@ -96,7 +103,6 @@ class ChainCatalogIndex:
                     self.chains = json.load(f)
                 self.last_mtime = mtime
 
-                # Categorize chains
                 self.global_chains = [c for c in self.chains if "global_" in c.lower()]
                 self.job_chains = [c for c in self.chains if "job_" in c.lower()]
                 self.ratchet_chains = [c for c in self.chains if "ratchet_" in c.lower()]
@@ -134,7 +140,6 @@ class ChainCatalogIndex:
         for name in pool:
             val = str(self.chains.get(name, ""))
             if not keyword_lower or keyword_lower in name.lower() or keyword_lower in val.lower():
-                # Determine type
                 if "global_" in name.lower():
                     cat = "global"
                 elif "job_" in name.lower():
@@ -144,11 +149,7 @@ class ChainCatalogIndex:
                 else:
                     cat = "tenant"
 
-                results.append({
-                    "chain_name": name,
-                    "identifier": val,
-                    "type": cat
-                })
+                results.append({"chain_name": name, "identifier": val, "type": cat})
                 if len(results) >= limit:
                     break
 
@@ -170,20 +171,35 @@ class ChainCatalogIndex:
 chain_catalog = ChainCatalogIndex(CHAINS_CACHE_PATH)
 
 # ==========================================
-# CMA GATEWAY HTTP CLIENT HELPER
+# CMA GATEWAY & WEB SESSION CLIENTS
 # ==========================================
+def get_cma_cookie() -> str:
+    """Retrieves active session cookie from env or file."""
+    cookie = os.getenv("CMA_COOKIE", "")
+    if not cookie:
+        env_path = os.path.join(SCRIPT_DIR, ".env")
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("CMA_COOKIE="):
+                        cookie = line.split("=", 1)[1].strip()
+                        break
+    return cookie
+
 def call_cma_gateway(
     endpoint: str,
     method: str = "GET",
     payload: Optional[Dict[str, Any]] = None,
-    timeout: float = 30.0,
+    timeout: float = 35.0,
 ) -> Dict[str, Any]:
     """Issues HTTP request to CMA Gateway with automatic URL fallback."""
     candidate_urls = [CMA_GATEWAY_URL]
     if "172.27.210.162" in CMA_GATEWAY_URL:
         candidate_urls.append("http://localhost:8555")
+        candidate_urls.append("http://cma-middleware:8555")
     elif "localhost" in CMA_GATEWAY_URL or "127.0.0.1" in CMA_GATEWAY_URL:
         candidate_urls.append("http://172.27.210.162:8555")
+        candidate_urls.append("http://cma-middleware:8555")
 
     last_error = None
     for base_url in candidate_urls:
@@ -191,7 +207,7 @@ def call_cma_gateway(
         headers = {
             "x-api-key": CMA_API_KEY,
             "Content-Type": "application/json",
-            "User-Agent": "CMA-MCP-Server/1.0",
+            "User-Agent": "CMA-MCP-Server/2.0",
         }
         data_bytes = json.dumps(payload).encode("utf-8") if payload else None
 
@@ -225,12 +241,32 @@ def call_cma_gateway(
     return {
         "status": "error",
         "code": 503,
-        "error": f"Could not connect to CMA Gateway at {candidate_urls}: {last_error}"
+        "error": f"Could not connect to CMA Gateway: {last_error}"
     }
 
-# ==========================================
-# SQLITE AUDIT DATABASE HELPER
-# ==========================================
+def call_cma_web(
+    path: str,
+    method: str = "GET",
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = 15.0,
+) -> Optional[requests.Response]:
+    """Issues direct authenticated request to the live CMA portal."""
+    cookie = get_cma_cookie()
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": f"{CMA_WEB_BASE}/adhocSql/viewAdhoc",
+        "Origin": "https://g3-cma.ideas.com"
+    }
+    url = f"{CMA_WEB_BASE.rstrip('/')}/{path.lstrip('/')}"
+    try:
+        if method.upper() == "POST":
+            return requests.post(url, headers=headers, data=data, timeout=timeout)
+        return requests.get(url, headers=headers, params=data, timeout=timeout)
+    except Exception as e:
+        logger.error("Error calling CMA web path %s: %s", path, e)
+        return None
+
 def get_db_connection() -> Optional[sqlite3.Connection]:
     if not os.path.exists(DB_FILE):
         return None
@@ -238,13 +274,12 @@ def get_db_connection() -> Optional[sqlite3.Connection]:
         conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         return conn
-    except Exception as e:
+    except Exception:
         try:
             conn = sqlite3.connect(DB_FILE)
             conn.row_factory = sqlite3.Row
             return conn
         except Exception:
-            logger.debug("Failed to open sqlite db %s: %s", DB_FILE, e)
             return None
 
 # ==========================================
@@ -257,7 +292,7 @@ from starlette.routing import Route
 mcp_server = MCPServer("cma-mcp-server")
 
 # ==========================================
-# TOOLS IMPLEMENTATION
+# DOMAIN 1: CORE SQL & BATCH EXECUTION
 # ==========================================
 
 @mcp_server.tool()
@@ -277,13 +312,8 @@ def cma_execute_query(
     if not clean_query:
         return {"status": "error", "error": "Query cannot be empty."}
 
-    # Normalize chain if tenant label format ('0018 - Hotel Katerina')
     target_chain = chain.strip()
-    payload = {
-        "chains": [target_chain],
-        "query": clean_query,
-        "format": "json"
-    }
+    payload = {"chains": [target_chain], "query": clean_query, "format": "json"}
 
     t0 = time.monotonic()
     resp = call_cma_gateway("/api/v1/execute_batch", method="POST", payload=payload, timeout=timeout)
@@ -300,7 +330,6 @@ def cma_execute_query(
         }
 
     data_block = resp.get("data", {})
-    # Extract records: could be under target_chain or normalized tenant code
     chain_data = data_block.get(target_chain)
     if chain_data is None and " - " in target_chain:
         tenant_code = target_chain.split(" - ", 1)[0].strip().split(".")[-1]
@@ -340,12 +369,7 @@ def cma_execute_batch(
     if not chains or not clean_queries:
         return {"status": "error", "error": "Both chains and queries must be non-empty."}
 
-    payload = {
-        "chains": chains,
-        "queries": clean_queries,
-        "format": "json"
-    }
-
+    payload = {"chains": chains, "queries": clean_queries, "format": "json"}
     t0 = time.monotonic()
     resp = call_cma_gateway("/api/v1/execute_batch", method="POST", payload=payload, timeout=timeout)
     elapsed = round(time.monotonic() - t0, 3)
@@ -366,6 +390,9 @@ def cma_execute_batch(
         "results": resp.get("data", {})
     }
 
+# ==========================================
+# DOMAIN 2: CHAIN CATALOG & RESOLUTION
+# ==========================================
 
 @mcp_server.tool()
 def cma_search_chains(
@@ -403,7 +430,7 @@ def cma_list_all_chains(
     """Paginate and list database chains from the catalog.
     
     Args:
-        chain_type: Filter by chain category: 'all', 'global', 'job', 'ratchet', or 'tenant'.
+        chain_type: Filter by category: 'all', 'global', 'job', 'ratchet', or 'tenant'.
         limit: Number of items per page (default 100).
         offset: Offset for pagination (default 0).
     """
@@ -458,13 +485,7 @@ def cma_get_chain_details(
         }
 
     cat = "global" if "global_" in chain_name.lower() else ("job" if "job_" in chain_name.lower() else ("ratchet" if "ratchet_" in chain_name.lower() else "tenant"))
-
-    res = {
-        "status": "found",
-        "chain_name": chain_name,
-        "identifier": identifier,
-        "type": cat,
-    }
+    res = {"status": "found", "chain_name": chain_name, "identifier": identifier, "type": cat}
 
     if test_connection:
         t0 = time.monotonic()
@@ -479,6 +500,146 @@ def cma_get_chain_details(
 
 
 @mcp_server.tool()
+def cma_resolve_tenant_environment(
+    client_code: str = "",
+    property_code: str = "",
+) -> Dict[str, Any]:
+    """Automatically identify which G3 production cluster (PROD_1..6) hosts a client or hotel.
+    
+    Args:
+        client_code: Client code (e.g. 'Hilton', 'BSTN', 'IHG').
+        property_code: Property short code (e.g. 'ATLFY', 'H1', '0018').
+    """
+    if not client_code and not property_code:
+        return {"status": "error", "error": "Either client_code or property_code must be provided."}
+
+    prod_clusters = ["global_PROD_1", "global_PROD_2", "global_PROD_3", "global_PROD_5", "global_PROD_6"]
+    
+    where_parts = []
+    if client_code:
+        where_parts.append(f"c.Client_Code = '{client_code.strip()}'")
+    if property_code:
+        where_parts.append(f"p.Property_Code = '{property_code.strip()}'")
+    where_sql = " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT TOP 1 p.Property_ID, p.Property_Code, p.Property_Name, p.Stage, c.Client_Code, c.Client_Name
+        FROM Property p
+        LEFT JOIN Client c ON c.Client_ID = p.Client_ID
+        WHERE {where_sql}
+    """
+
+    for gchain in prod_clusters:
+        res = cma_execute_query(chain=gchain, query=sql, timeout=12.0)
+        if res.get("status") == "success" and res.get("data"):
+            row = res["data"][0]
+            cluster_num = gchain.replace("global_PROD_", "")
+            
+            # Search matched tenant chains in cache
+            search_key = property_code or client_code
+            matching_tenant_chains = chain_catalog.search(keyword=search_key, chain_type="tenant", limit=5)
+
+            return {
+                "status": "resolved",
+                "cluster": f"PROD_{cluster_num}",
+                "global_chain": gchain,
+                "job_chain": f"job_PROD_{cluster_num}",
+                "ratchet_chain": f"ratchet_PROD_{cluster_num}",
+                "property_details": row,
+                "suggested_tenant_chains": matching_tenant_chains
+            }
+
+    return {
+        "status": "not_found",
+        "error": f"Could not find active record for client '{client_code}' / property '{property_code}' across {prod_clusters}."
+    }
+
+
+@mcp_server.tool()
+def cma_get_client_portfolio(
+    client_code: str,
+    global_chain: str = "global_PROD_1",
+) -> Dict[str, Any]:
+    """Retrieve all properties owned or operated by a client group across G3 Global databases.
+    
+    Args:
+        client_code: Client code (e.g. 'BSTN', 'Hilton', 'IHG').
+        global_chain: G3 Global database chain (default 'global_PROD_1').
+    """
+    sql = f"""
+        SELECT p.Property_ID, p.Property_Code, p.Property_Name, p.Stage,
+               p.SFDC_Account_Number, p.UPS_ID, p.Country_Code, p.Deployment_Status, p.Is_Virtual_Property
+        FROM Property p
+        JOIN Client c ON c.Client_ID = p.Client_ID
+        WHERE c.Client_Code = '{client_code.strip()}'
+        ORDER BY p.Property_Code
+    """
+    res = cma_execute_query(chain=global_chain, query=sql)
+    if res.get("status") == "success":
+        for r in res.get("data", []):
+            st = str(r.get("Stage", "")).strip()
+            r["Resolved_Mode"] = STAGE_MODE_MAP.get(st, st)
+    return res
+
+# ==========================================
+# DOMAIN 3: SCHEMA & METADATA DISCOVERY
+# ==========================================
+
+@mcp_server.tool()
+def cma_list_tables(
+    chain: str,
+    pattern: str = "*",
+) -> Dict[str, Any]:
+    """List tables and views on any database chain (Global, Job, Ratchet, or Tenant) matching a wildcard pattern.
+    
+    Args:
+        chain: Database chain name (e.g. 'global_PROD_1', 'job_PROD_1', 'Hilton-ATLFY').
+        pattern: Wildcard search pattern (e.g. '*PACE*', '*USER*', '*PARAM*', '*JOB*'). Defaults to '*'.
+    """
+    sql_like = pattern.replace("*", "%").replace("?", "_").strip()
+    sql = f"""
+        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_NAME LIKE '{sql_like}'
+        ORDER BY TABLE_TYPE, TABLE_NAME
+    """
+    return cma_execute_query(chain=chain, query=sql)
+
+
+@mcp_server.tool()
+def cma_describe_table(
+    chain: str,
+    table_name: str,
+) -> Dict[str, Any]:
+    """Reflect table schema: column names, data types, nullability, character lengths, and default values.
+    
+    Args:
+        chain: Target database chain name (e.g. 'global_PROD_1', 'Hilton-ATLFY').
+        table_name: Table name to describe (e.g. 'Property', 'Accom_Activity', 'JOB_INSTANCE').
+    """
+    clean_table = re.sub(r"[^A-Za-z0-9_]", "", table_name.strip())
+    sql = f"""
+        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{clean_table}'
+        ORDER BY ORDINAL_POSITION
+    """
+    res = cma_execute_query(chain=chain, query=sql)
+    if res.get("status") == "success":
+        return {
+            "status": "success",
+            "chain": chain,
+            "table_name": clean_table,
+            "column_count": res.get("row_count", 0),
+            "columns": res.get("data", [])
+        }
+    return res
+
+# ==========================================
+# DOMAIN 4: GLOBAL PROPERTY & CONFIGURATION
+# ==========================================
+
+@mcp_server.tool()
 def cma_get_property(
     property_id: str = "",
     property_code: str = "",
@@ -491,7 +652,7 @@ def cma_get_property(
     Args:
         property_id: Numeric Property_ID (e.g. '5').
         property_code: Property short code (e.g. 'H1', 'LONME', 'ATLFY').
-        client_code: Optional client code to narrow lookup (e.g. 'BSTN', 'Hilton').
+        client_code: Optional client code to narrow lookup.
         global_chain: G3 Global database chain (default 'global_PROD_1').
         include_audit_history: If True, fetches recent stage transitions from Property_AUD (default True).
     """
@@ -523,7 +684,6 @@ def cma_get_property(
             "status": "not_found",
             "error": "Property not found with given criteria",
             "criteria": {"property_id": property_id, "property_code": property_code, "client_code": client_code},
-            "raw_response": res
         }
 
     records = res["data"]
@@ -556,11 +716,7 @@ def cma_get_property(
 
         enriched.append(prop_copy)
 
-    return {
-        "status": "success",
-        "count": len(enriched),
-        "properties": enriched
-    }
+    return {"status": "success", "count": len(enriched), "properties": enriched}
 
 
 @mcp_server.tool()
@@ -575,23 +731,18 @@ def cma_get_property_parameters(
     Args:
         client_code: Client code (e.g. 'Hilton', 'BSTN').
         property_code: Property short code (e.g. 'ATLFY', '0018').
-        parameter_names: List of specific parameter names to inspect. If omitted or empty, retrieves top 100 parameters.
+        parameter_names: List of specific parameter names to inspect. If omitted, retrieves all parameters.
         global_chain: G3 Global database chain (default 'global_PROD_1').
     """
     client_clean = client_code.strip()
     prop_clean = property_code.strip()
     prop_padded = prop_clean.zfill(4) if prop_clean.isdigit() else prop_clean
 
-    contexts = [
-        "pacman",
-        f"pacman.{client_clean}",
-        f"pacman.{client_clean}.{prop_clean}",
-    ]
+    contexts = ["pacman", f"pacman.{client_clean}", f"pacman.{client_clean}.{prop_clean}"]
     if prop_padded != prop_clean:
         contexts.append(f"pacman.{client_clean}.{prop_padded}")
 
     contexts_sql = ", ".join(f"'{c}'" for c in contexts)
-
     name_filter = ""
     if parameter_names:
         clean_names = [f"'{n.strip()}'" for n in parameter_names if n.strip()]
@@ -625,13 +776,11 @@ def cma_get_property_parameters(
 
         if pname not in grouped:
             grouped[pname] = {"hierarchy": {}, "effective_value": None, "effective_context": None}
-
         grouped[pname]["hierarchy"][ctx] = val
 
-    # Resolve cascading hierarchy: property-level > client-level > global pacman
+    # Resolve hierarchy: property > client > global
     for pname, item in grouped.items():
         hier = item["hierarchy"]
-        # Check property level
         prop_ctx_1 = f"pacman.{client_clean}.{prop_clean}"
         prop_ctx_2 = f"pacman.{client_clean}.{prop_padded}"
         client_ctx = f"pacman.{client_clean}"
@@ -657,6 +806,39 @@ def cma_get_property_parameters(
         "parameters": grouped
     }
 
+
+@mcp_server.tool()
+def cma_get_datafeed_config(
+    property_id: str = "",
+    client_code: str = "",
+    global_chain: str = "global_PROD_1",
+) -> Dict[str, Any]:
+    """Retrieve PMS/RMS interface configurations, datafeed endpoints, and FTP settings.
+    
+    Args:
+        property_id: Numeric Property_ID.
+        client_code: Client code (e.g. 'BSTN', 'Hilton').
+        global_chain: G3 Global database chain (default 'global_PROD_1').
+    """
+    where_clause = f"WHERE p.Property_ID = '{property_id.strip()}'" if property_id else f"WHERE c.Client_Code = '{client_code.strip()}'"
+    sql = f"""
+        SELECT TOP 20
+            p.Property_ID, p.Property_Code, p.Property_Name,
+            df.Datafeed_ID, df.Name AS Datafeed_Name, df.Status_ID,
+            dfe.Datafeed_Endpoint_ID, dfe.Endpoint_Type_ID, dfe.Server_Name, dfe.Remote_Path,
+            ftp.FTP_Server_Address, ftp.FTP_User_Name
+        FROM Property p
+        LEFT JOIN Client c ON c.Client_ID = p.Client_ID
+        LEFT JOIN Datafeed df ON df.Property_ID = p.Property_ID
+        LEFT JOIN Datafeed_Endpoint dfe ON dfe.Datafeed_ID = df.Datafeed_ID
+        LEFT JOIN Datafeed_FTP_Config ftp ON ftp.Datafeed_Endpoint_ID = dfe.Datafeed_Endpoint_ID
+        {where_clause}
+    """
+    return cma_execute_query(chain=global_chain, query=sql)
+
+# ==========================================
+# DOMAIN 5: SPRING BATCH JOB OPERATIONS
+# ==========================================
 
 @mcp_server.tool()
 def cma_get_job_execution(
@@ -707,9 +889,84 @@ def cma_get_job_execution(
             ORDER BY je.START_TIME DESC
         """
 
-    res = cma_execute_query(chain=job_chain, query=sql)
-    return res
+    return cma_execute_query(chain=job_chain, query=sql)
 
+
+@mcp_server.tool()
+def cma_get_failed_jobs(
+    job_chain: str = "job_PROD_1",
+    hours_back: int = 24,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """Retrieve failed batch executions with step-level error traces and exit codes.
+    
+    Args:
+        job_chain: G3 Job database chain (default 'job_PROD_1').
+        hours_back: Hours to look back for failures (default 24).
+        limit: Max failed executions to return (default 20).
+    """
+    cutoff = (datetime.now() - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = f"""
+        SELECT TOP {limit}
+            ji.JOB_NAME, je.JOB_EXECUTION_ID, je.STATUS, je.START_TIME, je.END_TIME,
+            je.EXIT_CODE, je.EXIT_MESSAGE,
+            se.STEP_NAME, se.STATUS AS STEP_STATUS, se.EXIT_CODE AS STEP_EXIT_CODE
+        FROM JOB_INSTANCE ji
+        JOIN JOB_EXECUTION je ON je.JOB_INSTANCE_ID = ji.JOB_INSTANCE_ID
+        LEFT JOIN STEP_EXECUTION se ON se.JOB_EXECUTION_ID = je.JOB_EXECUTION_ID AND se.STATUS = 'FAILED'
+        WHERE je.STATUS = 'FAILED'
+          AND je.START_TIME >= '{cutoff}'
+        ORDER BY je.START_TIME DESC
+    """
+    return cma_execute_query(chain=job_chain, query=sql)
+
+
+@mcp_server.tool()
+def cma_get_blocked_jobs(
+    job_chain: str = "job_PROD_1",
+) -> Dict[str, Any]:
+    """Check for stuck, blocked, or throttled batch jobs in the job cluster.
+    
+    Args:
+        job_chain: G3 Job database chain (default 'job_PROD_1').
+    """
+    sql = """
+        SELECT TOP 50
+            bj.JOB_NAME, bj.REASON, bj.CREATE_DTTM,
+            js.JOB_STATE_ID, js.IS_BLOCKED, js.LAST_UPDATED_DTTM
+        FROM Blocked_Job bj
+        FULL OUTER JOIN JOB_STATE js ON js.JOB_NAME = bj.JOB_NAME
+        WHERE bj.JOB_NAME IS NOT NULL OR js.IS_BLOCKED = 1
+        ORDER BY COALESCE(bj.CREATE_DTTM, js.LAST_UPDATED_DTTM) DESC
+    """
+    return cma_execute_query(chain=job_chain, query=sql)
+
+
+@mcp_server.tool()
+def cma_get_job_daily_stats(
+    job_chain: str = "job_PROD_1",
+    days_back: int = 7,
+) -> Dict[str, Any]:
+    """Retrieve aggregated daily job throughput, success rates, and average durations.
+    
+    Args:
+        job_chain: G3 Job database chain (default 'job_PROD_1').
+        days_back: Days of historical stats to retrieve (default 7).
+    """
+    cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    sql = f"""
+        SELECT TOP 100
+            Processing_Date, JOB_NAME, Total_Count, Success_Count, Fail_Count,
+            Avg_Duration_Seconds, Max_Duration_Seconds
+        FROM DAILY_JOB_STATISTICS
+        WHERE Processing_Date >= '{cutoff}'
+        ORDER BY Processing_Date DESC, Total_Count DESC
+    """
+    return cma_execute_query(chain=job_chain, query=sql)
+
+# ==========================================
+# DOMAIN 6: TENANT REVENUE & PACING
+# ==========================================
 
 @mcp_server.tool()
 def cma_get_tenant_table_data(
@@ -725,9 +982,9 @@ def cma_get_tenant_table_data(
     Args:
         chain: Tenant database chain name (e.g. 'Hilton-ATLFY').
         table_name: Target table name.
-        where_clause: Optional WHERE clause without the 'WHERE' keyword (e.g. "OCCUPANCY_DATE >= '2026-01-01'").
+        where_clause: Optional WHERE clause without 'WHERE' (e.g. "OCCUPANCY_DATE >= '2026-01-01'").
         columns: Specific columns to project. Defaults to '*' if omitted.
-        order_by: Optional ORDER BY clause without the 'ORDER BY' keyword (e.g. "OCCUPANCY_DATE DESC").
+        order_by: Optional ORDER BY clause without 'ORDER BY'.
         limit: Max rows to return (capped at 5000, default 100).
     """
     clean_table = re.sub(r"[^A-Za-z0-9_]", "", table_name.strip())
@@ -749,15 +1006,477 @@ def cma_get_tenant_table_data(
 
 
 @mcp_server.tool()
+def cma_get_tenant_revenue_summary(
+    tenant_chain: str,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Any]:
+    """Aggregate actual rooms sold, room revenue, and ADR from tenant Accom_Activity for reconciliation.
+    
+    Args:
+        tenant_chain: Tenant database chain (e.g. 'Hilton-ATLFY').
+        start_date: Start date YYYY-MM-DD.
+        end_date: End date YYYY-MM-DD.
+    """
+    sql = f"""
+        SELECT 
+            COUNT(*) AS Days_Count,
+            SUM(CAST(Rooms_Sold AS FLOAT)) AS Total_Rooms_Sold,
+            SUM(CAST(Room_Revenue AS DECIMAL(18,2))) AS Total_Room_Revenue,
+            ROUND(SUM(CAST(Room_Revenue AS DECIMAL(18,2))) / NULLIF(SUM(CAST(Rooms_Sold AS FLOAT)), 0), 2) AS Calculated_ADR
+        FROM Accom_Activity
+        WHERE Occupancy_DT BETWEEN '{start_date.strip()}' AND '{end_date.strip()}';
+    """
+    return cma_execute_query(chain=tenant_chain, query=sql)
+
+
+@mcp_server.tool()
+def cma_get_tenant_pace_data(
+    tenant_chain: str,
+) -> Dict[str, Any]:
+    """Retrieve the latest pacing snapshot (STLY rooms sold and revenue) from tenant PACE_Accom_Activity.
+    
+    Args:
+        tenant_chain: Tenant database chain (e.g. 'Hilton-ATLFY').
+    """
+    sql = """
+        SELECT
+            MAX(Business_Day_End_DT) AS Snapshot_Date,
+            SUM(CAST(Rooms_Sold AS FLOAT)) AS STLY_Rooms_Sold,
+            SUM(CAST(Room_Revenue AS DECIMAL(18,2))) AS STLY_Room_Revenue
+        FROM PACE_Accom_Activity WITH (NOLOCK)
+        WHERE Business_Day_End_DT = (
+            SELECT MAX(Business_Day_End_DT)
+            FROM PACE_Accom_Activity WITH (NOLOCK)
+            WHERE Business_Day_End_DT <= CAST(GETDATE() AS DATE)
+        );
+    """
+    return cma_execute_query(chain=tenant_chain, query=sql)
+
+
+@mcp_server.tool()
+def cma_get_ratchet_srp_mappings(
+    client_code: str = "",
+    property_code: str = "",
+    ratchet_chain: str = "ratchet_PROD_1",
+) -> Dict[str, Any]:
+    """Query Standard Rate Plan (SRP) mappings and channel restrictions in G3 Ratchet database.
+    
+    Args:
+        client_code: Client short code.
+        property_code: Property short code.
+        ratchet_chain: Ratchet chain (default 'ratchet_PROD_1').
+    """
+    where_parts = []
+    if client_code:
+        where_parts.append(f"rc.Client_Code = '{client_code.strip()}'")
+    if property_code:
+        where_parts.append(f"rp.Property_Code = '{property_code.strip()}'")
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    sql = f"""
+        SELECT TOP 50
+            rc.Client_Code, rp.Property_Code, csm.SRP_Code, csm.Channel_Code,
+            csm.Active_Flag, csm.Rate_Level
+        FROM Client_Srp_Mapping csm
+        LEFT JOIN Ratchet_Client rc ON rc.Ratchet_Client_ID = csm.Ratchet_Client_ID
+        LEFT JOIN Ratchet_Property rp ON rp.Ratchet_Property_ID = csm.Ratchet_Property_ID
+        {where_sql}
+        ORDER BY rc.Client_Code, rp.Property_Code, csm.SRP_Code
+    """
+    return cma_execute_query(chain=ratchet_chain, query=sql)
+
+# ==========================================
+# DOMAIN 7: PORTAL AUDIT & SFDC CASE LINK
+# ==========================================
+
+@mcp_server.tool()
+def cma_get_sfdc_case_audit_history(
+    case_number: str,
+    start_date: str = "",
+    end_date: str = "",
+) -> Dict[str, Any]:
+    """Search CMA portal audit logs for every query executed against a specific Salesforce Case Number.
+    
+    Args:
+        case_number: 8-digit Salesforce Case Number (e.g. '03019231').
+        start_date: Start date YYYY-MM-DD (defaults to 1 year ago).
+        end_date: End date YYYY-MM-DD (defaults to tomorrow).
+    """
+    clean_case = case_number.strip().lstrip("0") or case_number.strip()
+    s_date = start_date.strip() or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    e_date = end_date.strip() or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    post_data = {
+        "filterSelection": "sfdc",
+        "caseNumber": clean_case,
+        "startDate": s_date,
+        "endDate": e_date,
+    }
+
+    resp = call_cma_web("/report/displayAuditReport/auditReportFilterForm", method="POST", data=post_data, timeout=15.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to query audit report: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", class_="mainTableSet")
+    if not table:
+        return {"status": "success", "case_number": case_number, "audit_entries_count": 0, "entries": []}
+
+    rows = []
+    for tr in table.find_all("tr")[1:]:
+        cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if len(cols) >= 8 and cols[0] != "No results found":
+            # Extract audit_id from detail link
+            detail_link = tr.find("a")
+            audit_id = ""
+            if detail_link and "audit_id=" in detail_link.get("href", ""):
+                audit_id = detail_link.get("href").split("audit_id=")[-1]
+
+            rows.append({
+                "row_number": cols[0],
+                "chain": cols[1],
+                "property": cols[2],
+                "user_name": cols[3],
+                "action": cols[4],
+                "action_detail": cols[5],
+                "audit_id": audit_id,
+                "date": cols[6],
+                "sfdc_case_number": cols[7]
+            })
+
+    return {
+        "status": "success",
+        "case_number": case_number,
+        "audit_entries_count": len(rows),
+        "entries": rows
+    }
+
+
+@mcp_server.tool()
+def cma_get_audit_query_text(
+    audit_id: str,
+) -> Dict[str, Any]:
+    """Retrieve the exact SQL query text, parameter hints, and execution metadata for a given CMA audit_id.
+    
+    Args:
+        audit_id: CMA numeric audit transaction ID (e.g. '881559367').
+    """
+    clean_id = audit_id.strip()
+    resp = call_cma_web(f"/report/showDetails?audit_id={clean_id}", method="GET", timeout=10.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to retrieve audit details: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text_content = soup.get_text("\n", strip=True)
+
+    # Extract query text and metadata
+    raw_query = ""
+    query_name = ""
+    for tr in soup.find_all("tr"):
+        txt = tr.get_text(" ", strip=True)
+        if "Query Name:" in txt:
+            query_name = txt.split("Query Name:")[-1].split("Query:")[0].strip()
+        if "Query:" in txt or "select" in txt.lower():
+            raw_query = txt
+
+    return {
+        "status": "success",
+        "audit_id": clean_id,
+        "query_name": query_name,
+        "full_text": raw_query or text_content[:1500]
+    }
+
+# ==========================================
+# DOMAIN 8: CURATED SCRIPT LIBRARY
+# ==========================================
+
+@mcp_server.tool()
+def cma_search_saved_queries(
+    keyword: str = "",
+    tag: str = "",
+    query_type: str = "",
+    limit: int = 30,
+) -> Dict[str, Any]:
+    """Search the 2,000+ curated engineering SQL queries saved in CMA by SFDC Case, keyword, or tag.
+    
+    Args:
+        keyword: Search term in query name or description (e.g. '03019231', 'MGM', 'DTA', 'Wash Override').
+        tag: Operational tag filter (e.g. 'L2 Support', 'IM', 'Overbooking', 'FPLOS', 'Pace Alert', 'Casper').
+        query_type: SQL operation type: 'Select', 'Insert', 'Update'.
+        limit: Max results to return (default 30).
+    """
+    resp = call_cma_web("/viewSql/view", method="GET", timeout=15.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to load query library: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", class_="mainTableSet")
+    if not table:
+        return {"status": "success", "results": []}
+
+    kw_lower = keyword.lower().strip()
+    tag_lower = tag.lower().strip()
+    type_lower = query_type.lower().strip()
+
+    matches = []
+    for tr in table.find_all("tr")[1:]:
+        cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if len(cols) >= 5:
+            q_name = cols[0]
+            q_desc = cols[1]
+            q_scope = cols[2]
+            q_type = cols[3]
+            q_creator = cols[4]
+
+            link = tr.find("a")
+            query_id = ""
+            if link and "/viewDetails/" in link.get("href", ""):
+                query_id = link.get("href").split("/viewDetails/")[-1]
+
+            # Matching criteria
+            match_kw = not kw_lower or (kw_lower in q_name.lower() or kw_lower in q_desc.lower())
+            match_type = not type_lower or (type_lower in q_type.lower())
+
+            if match_kw and match_type:
+                matches.append({
+                    "query_id": query_id,
+                    "query_name": q_name,
+                    "description": q_desc[:250],
+                    "query_scope": q_scope,
+                    "query_type": q_type,
+                    "creator": q_creator,
+                })
+                if len(matches) >= limit:
+                    break
+
+    return {
+        "status": "success",
+        "matched_count": len(matches),
+        "queries": matches
+    }
+
+
+@mcp_server.tool()
+def cma_get_saved_query_details(
+    query_id: str,
+) -> Dict[str, Any]:
+    """Retrieve full parameterized SQL code, assigned roles, and parameters for a saved query from CMA library.
+    
+    Args:
+        query_id: Query ID in CMA viewSql library (e.g. '2467', '2596').
+    """
+    clean_id = query_id.strip()
+    resp = call_cma_web(f"/viewSql/viewDetails/{clean_id}", method="GET", timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to retrieve query details: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    textareas = soup.find_all("textarea")
+    description = textareas[0].get_text(strip=True) if len(textareas) > 0 else ""
+    sql_text = textareas[1].get_text(strip=True) if len(textareas) > 1 else ""
+
+    metadata = {}
+    for tr in soup.find_all("tr"):
+        tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if len(tds) >= 2 and tds[0]:
+            metadata[tds[0].rstrip(":")] = tds[1]
+
+    return {
+        "status": "success",
+        "query_id": clean_id,
+        "description": description,
+        "sql_code": sql_text,
+        "metadata": metadata
+    }
+
+# ==========================================
+# DOMAIN 9: TEAM TASKS & REAL-TIME JOBS
+# ==========================================
+
+@mcp_server.tool()
+def cma_get_team_task_feed(
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """Retrieve live feed of queries and background tasks currently being executed across the team in CMA.
+    
+    Args:
+        limit: Max tasks to return (default 20).
+    """
+    resp = call_cma_web("/taskStatus/myTeamTasks", method="GET", timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to fetch team tasks: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    tables = soup.find_all("table", class_="mainTableSet")
+    
+    tasks = []
+    # Skip outer container table if present
+    for t in tables[1:]:
+        for tr in t.find_all("tr"):
+            cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cols) >= 7 and cols[0] != "Chain ID":
+                tasks.append({
+                    "chain_id": cols[0],
+                    "chain_name": cols[1],
+                    "query_name": cols[2],
+                    "sql_snippet": cols[3],
+                    "timestamp": cols[5],
+                    "status": cols[6]
+                })
+                if len(tasks) >= limit:
+                    break
+        if len(tasks) >= limit:
+            break
+
+    return {
+        "status": "success",
+        "task_count": len(tasks),
+        "tasks": tasks
+    }
+
+
+@mcp_server.tool()
+def cma_get_task_status_by_job_id(
+    job_id: str,
+) -> Dict[str, Any]:
+    """Search and inspect real-time progress of a CMA background batch task by its Job ID.
+    
+    Args:
+        job_id: Numeric Job ID (e.g. '348244').
+    """
+    clean_id = job_id.strip()
+    post_data = {"selectedJobId": clean_id}
+    resp = call_cma_web("/taskStatus/searchByJobId", method="POST", data=post_data, timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to search by job id: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", class_="mainTableSet")
+    tasks = []
+    if table:
+        for tr in table.find_all("tr")[1:]:
+            cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cols) >= 5:
+                tasks.append({"chain": cols[0], "query": cols[1], "status": cols[-1], "details": cols})
+
+    return {
+        "status": "success",
+        "job_id": clean_id,
+        "records_count": len(tasks),
+        "records": tasks
+    }
+
+# ==========================================
+# DOMAIN 10: FILE EXPLORER & PARAMETERS
+# ==========================================
+
+@mcp_server.tool()
+def cma_list_server_explorer_directories() -> Dict[str, Any]:
+    """Discover available remote server explorer nodes (G3 Prod 1..6 and RSS Prod 1..6 data directories)."""
+    resp = call_cma_web("/fileExplorer/connect", method="GET", timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to connect to file explorer: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    tags = []
+    tag_select = soup.find("select", {"name": "selectedTag"})
+    if tag_select:
+        tags = [opt.get_text(strip=True) for opt in tag_select.find_all("option") if opt.get_text(strip=True) != "--Select--"]
+
+    explorers = []
+    unc_select = soup.find("select", {"name": "uncData"})
+    if unc_select:
+        explorers = [opt.get_text(strip=True) for opt in unc_select.find_all("option") if opt.get_text(strip=True) != "-Select-"]
+
+    return {
+        "status": "success",
+        "available_explorers": explorers,
+        "available_tags": tags,
+        "description": "Browse server directories and log drops across G3 Prod 1..6 Data and RSS Prod 1..6."
+    }
+
+
+@mcp_server.tool()
+def cma_get_property_system_parameters_catalog() -> Dict[str, Any]:
+    """Retrieve the master catalog of Property System Parameters (PSPs) and active Cognito JWT tokens."""
+    resp = call_cma_web("/psparameter/list", method="GET", timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to retrieve PSP catalog: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", class_="mainTableSet")
+    psps = []
+    if table:
+        for tr in table.find_all("tr")[2:]:
+            cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cols) >= 5:
+                psps.append({
+                    "id": cols[0],
+                    "name": cols[1],
+                    "description": cols[2],
+                    "category": cols[3],
+                    "module": cols[4]
+                })
+
+    # Check for Manager signature token
+    dialog = soup.find("dialog", id="myDialog")
+    token_str = ""
+    if dialog:
+        btn = dialog.find("button")
+        if btn and "copyManagerAccessToken('" in btn.get("onclick", ""):
+            token_str = btn.get("onclick").split("copyManagerAccessToken('")[-1].split("')")[0]
+
+    return {
+        "status": "success",
+        "psp_count": len(psps),
+        "parameters": psps,
+        "manager_signature_token_available": bool(token_str),
+        "manager_signature_token": token_str[:30] + "..." if token_str else None
+    }
+
+
+@mcp_server.tool()
+def cma_get_scheduled_sql_jobs() -> Dict[str, Any]:
+    """Inspect active recurring scheduled SQL jobs, execution frequencies, and target chains in CMA."""
+    resp = call_cma_web("/scheduleSql/listView", method="GET", timeout=12.0)
+    if not resp or resp.status_code != 200:
+        return {"status": "error", "error": f"Failed to load scheduled SQL: HTTP {getattr(resp, 'status_code', 'None')}"}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", class_="mainTableSet")
+    jobs = []
+    if table:
+        for tr in table.find_all("tr")[1:]:
+            cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cols) >= 6 and cols[0] != "No Records Found":
+                jobs.append({
+                    "query": cols[0],
+                    "scheduled_by": cols[1],
+                    "all_chains": cols[2],
+                    "frequency": cols[3],
+                    "time": cols[4],
+                    "file_name": cols[5]
+                })
+
+    return {
+        "status": "success",
+        "scheduled_jobs_count": len(jobs),
+        "jobs": jobs
+    }
+
+# ==========================================
+# DOMAIN 11: TELEMETRY & SESSION RESILIENCE
+# ==========================================
+
+@mcp_server.tool()
 def cma_get_session_status() -> Dict[str, Any]:
     """Inspect active CMA session status, cookie validity, and circuit breaker status."""
     resp = call_cma_gateway("/api/internal/needs_cookie", method="GET", timeout=5.0)
 
-    # Read physical cookie length
-    active_cookie = os.getenv("CMA_COOKIE", "")
+    active_cookie = get_cma_cookie()
     cookie_preview = f"{active_cookie[:15]}...{active_cookie[-8:]}" if len(active_cookie) > 25 else "Not set"
 
-    # Check recent queries in DB
     db = get_db_connection()
     last_activity = None
     if db:
@@ -786,9 +1505,8 @@ def cma_trigger_sso_refresh(
     """Trigger the Chrome/Edge Virtual Desktop SSO auto-login to renew an expired JSESSIONID.
     
     Args:
-        force: If True, triggers re-login even if the cooldown period is currently active.
+        force: If True, triggers re-login even if cooldown period is active.
     """
-    # Test session first
     status = cma_get_session_status()
     if status.get("has_cookie") and not status.get("needs_cookie") and not force:
         return {
@@ -797,9 +1515,7 @@ def cma_trigger_sso_refresh(
             "session": status
         }
 
-    # Signal Edge / Chrome Extension by checking needs_cookie or calling update
     logger.info("Triggering SSO cookie refresh via CMA internal gateway...")
-    # Trigger refresh by pinging gateway
     resp = call_cma_gateway("/api/internal/needs_cookie", method="GET", timeout=5.0)
 
     return {
@@ -813,10 +1529,8 @@ def cma_trigger_sso_refresh(
 def cma_refresh_chains_cache() -> Dict[str, Any]:
     """Force an immediate refresh and reload of the 19,496+ cached database chains."""
     t0 = time.monotonic()
-    # Call admin refresh endpoint if reachable
-    resp = call_cma_gateway("/admin/refresh-chains", method="POST", payload={}, timeout=15.0)
+    call_cma_gateway("/admin/refresh-chains", method="POST", payload={}, timeout=15.0)
 
-    # Reload local cache
     chain_catalog.reload_if_needed(force=True)
     elapsed = round(time.monotonic() - t0, 3)
 
@@ -876,11 +1590,7 @@ def cma_get_audit_logs(
     try:
         cur = db.execute(query, params)
         rows = [dict(r) for r in cur.fetchall()]
-        return {
-            "status": "success",
-            "count": len(rows),
-            "logs": rows
-        }
+        return {"status": "success", "count": len(rows), "logs": rows}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -947,7 +1657,7 @@ async def health_endpoint(request):
     return JSONResponse({
         "status": "HEALTHY",
         "server": "cma-mcp-server",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "tools_count": len(tools),
         "session": session,
         "chains_indexed": len(chain_catalog.chains)
@@ -961,7 +1671,6 @@ def run_server(transport: str = "sse", host: str = MCP_HOST, port: int = MCP_POR
         import uvicorn
         logger.info("Starting CMA MCP Server in SSE mode on http://%s:%d/sse...", host, port)
         app = mcp_server.sse_app()
-        # Add health probe endpoint
         app.routes.append(Route("/health", health_endpoint, methods=["GET"]))
 
         config = uvicorn.Config(

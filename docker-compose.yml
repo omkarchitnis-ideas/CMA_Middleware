@@ -27,6 +27,7 @@ services:
     volumes:
       - ./api_gateway.db:/app/api_gateway.db:ro
       - ./chains_cache.json:/app/chains_cache.json:ro
+      - ./.env:/app/.env:ro
     environment:
       - CMA_GATEWAY_URL=http://cma-middleware:8555
       - CMA_API_KEY=cma_6Z2AkhS4ux70JGlTa4mzGeWVVhaQRGWu
