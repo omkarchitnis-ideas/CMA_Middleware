@@ -1,4 +1,4 @@
-﻿# Environment variables & secrets
+# Environment variables & secrets
 .env
 *.env
 
@@ -28,3 +28,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Persistent Edge Profile
+edge_profile/
+
+# Chains Cache
+chains_cache.json

@@ -1,0 +1,25 @@
+services:
+  cma-edge:
+    build:
+      context: .
+      dockerfile: Dockerfile.edge
+    container_name: cma-edge-test
+    restart: "no"
+    ports:
+      - "8555:8555"
+      - "6080:6080"
+    volumes:
+      - ./api_gateway.db:/app/api_gateway.db
+      - ./edge_profile:/app/edge_profile
+    env_file:
+      - .env
+    networks:
+      - cma_net
+
+networks:
+  cma_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.200.3.0/24

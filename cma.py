@@ -142,6 +142,15 @@ def trigger_sso_login(force=False):
             logger.info(f"Session expired! Attempting to launch batch file at: {bat_path}")
             
             if not os.path.exists(bat_path):
+                import shutil
+                if shutil.which("microsoft-edge-stable"):
+                    logger.info("Triggering in-container Edge navigation for SSO refresh...")
+                    subprocess.Popen(
+                        ["microsoft-edge-stable", "--no-sandbox", "https://g3-cma.ideas.com/cma/adhocSql/viewAdhoc"],
+                        env=dict(os.environ, DISPLAY=os.getenv("DISPLAY", ":99"))
+                    )
+                    LAST_BROWSER_LAUNCH = current_time
+                    return True
                 logger.warning(f"Batch file not found at {bat_path}. In Docker environment, relying on Chrome Extension auto-poll.")
                 LAST_BROWSER_LAUNCH = current_time
                 return True
@@ -153,7 +162,7 @@ def trigger_sso_login(force=False):
             return True
             
         except Exception as e:
-            logger.info(f"Native Chrome launch bypassed ({e}). In Docker container: Chrome Extension background worker will handle auto-login.")
+            logger.info(f"Native browser launch bypassed ({e}). In Docker container: Chrome Extension background worker will handle auto-login.")
             LAST_BROWSER_LAUNCH = current_time
             return True
     else:
