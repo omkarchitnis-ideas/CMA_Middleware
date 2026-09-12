@@ -2,13 +2,15 @@ services:
   cma-middleware:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.edge
     container_name: cma-middleware
     restart: unless-stopped
     ports:
       - "8555:8555"
+      - "6080:6080"
     volumes:
       - ./api_gateway.db:/app/api_gateway.db
+      - ./edge_profile:/app/edge_profile
     env_file:
       - .env
     networks:
